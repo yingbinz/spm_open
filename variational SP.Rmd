@@ -1,0 +1,481 @@
+---
+title: High usage-variation sequential patterns
+---
+
+```{r}
+library(openxlsx)
+library(tidyverse)
+library(arulesSequences)
+library(lubridate)
+```
+
+
+# Prepare data
+```{r}
+event_data <- read.csv("data/only_logs.csv", 1)
+```
+
+# Preprocessing data
+
+## some cleaning
+
+```{r}
+## clean the date column
+event_data$Date_Time <- sub('[a-zA-Z]{3}, ', "", event_data[,'Date_Time'],fixed=FALSE)
+event_data$Date_Time <- ymd_hm(event_data[,'Date_Time'])
+
+## create continuous event id and drop Log_ID
+event_data <- event_data %>% mutate(eventID = 1:n()) 
+
+## add a gap to events that happened in different date, drop unused columns
+event_data <- event_data %>% mutate(day = day(Date_Time) - 25) %>%
+  mutate(eventID = eventID + day*100)
+
+event_data[,c("Operation", "Operation_Property", "Code")] <-  
+  apply(event_data[,c("Operation", "Operation_Property", "Code")], 2, as.character) 
+```
+
+
+## remove TC follows OA/OC with same operation and operation property
+
+```{r}
+simple_event_data <- event_data
+
+next_n = 1
+next_n_columns <- data.frame(next_user = simple_event_data[(-1):(-next_n), "User"],
+                        next_eventID = simple_event_data[(-1):(-next_n), "eventID"],
+                        next_code = simple_event_data[(-1):(-next_n), "Code"], 
+                        next_operation = simple_event_data[(-1):(-next_n), "Operation"], 
+                        next_property = simple_event_data[(-1):(-next_n), "Operation_Property"])
+
+remaining_n_rows <- data.frame(next_user =  rep("End",next_n), 
+                                next_eventID =  rep(0,next_n),
+                               next_code =  rep("End",next_n),
+                                next_operation =  rep("End",next_n),
+                                next_property = rep("End",next_n))
+
+next_n_columns <- rbind(next_n_columns, remaining_n_rows)
+
+simple_event_data <- cbind(simple_event_data, next_n_columns)
+
+simple_event_data$next_operation_same <- with(simple_event_data, 
+                                               Operation == next_operation &
+                                               User == next_user & 
+                                               next_eventID - eventID == 1)
+
+  
+simple_event_data$next_property_same <- with(simple_event_data, 
+                                           Operation_Property == next_property &
+                                           User == next_user & 
+                                           next_eventID - eventID == 1)
+# TC follows OA with same operation and operation property should be deleted
+# TC follows OC with same operation and operation property should be deleted
+## whether the last has the same operation and porperty
+simple_event_data$last_same_operation <- 
+  c(FALSE,unlist(simple_event_data[-nrow(simple_event_data), "next_operation_same"])) 
+simple_event_data$last_same_property <- 
+      c(FALSE,unlist(simple_event_data[-nrow(simple_event_data), "next_property_same"])) 
+## put the last code to current row
+simple_event_data$last_code <- 
+  c(FALSE,unlist(simple_event_data[-nrow(simple_event_data), "Code"]))
+## remove qualified TC rows
+simple_event_data <- simple_event_data %>% filter(! (Code == "TC" & 
+                                                   last_code %in% c("OA", "OC") &
+                                                   last_same_operation &
+                                                   last_same_property))
+simple_event_data <- dplyr::select(simple_event_data,
+                                   -'last_same_operation', -'last_same_property', -'last_code',
+                           -'next_user', -'next_eventID', -'next_code', -'next_operation', -'next_property') 
+
+## since we remove some rows, we need to create new continuous event id
+simple_event_data <- simple_event_data %>% mutate(eventID = 1:n()) 
+## add a gap to events that happened in different date, drop unused columns
+simple_event_data <- simple_event_data %>% mutate(day = day(Date_Time) - 25) %>%
+  mutate(eventID = eventID + day*100)
+```
+
+
+## remove meaningless repeated events
+For events that are not among "AC","AR","Hx","AO","AI-1","AI-2","MI","CI", their repetitin is meaningless. Thus, removing them
+
+```{r}
+simple_event_data$next_n_minus_1_same = TRUE
+next_n = 1
+# put the next four row information to current row
+for (next_n in 1:5) {
+  next_n_columns <- data.frame(next_user = simple_event_data[(-1):(-next_n), "User"],
+                          next_eventID = simple_event_data[(-1):(-next_n), "eventID"],
+                          next_code = simple_event_data[(-1):(-next_n), "Code"], 
+                          next_operation = simple_event_data[(-1):(-next_n), "Operation"], 
+                          next_property = simple_event_data[(-1):(-next_n), "Operation_Property"],
+                          next_closedquestion = simple_event_data[(-1):(-next_n), "Closedquestion"])
+  
+  remaining_n_rows <- data.frame(next_user =  rep("End",next_n), 
+                                  next_eventID =  rep(0,next_n),
+                                 next_code =  rep("End",next_n),
+                                  next_operation =  rep("End",next_n),
+                                  next_property = rep("End",next_n),
+                                 next_closedquestion = rep("End",next_n))
+
+  next_n_columns <- rbind(next_n_columns, remaining_n_rows)
+  
+  simple_event_data <- cbind(simple_event_data, next_n_columns)
+  
+  simple_event_data$next_action_same <- with(simple_event_data,
+                                          next_n_minus_1_same &   
+                                           Code == next_code &
+                                             Operation_Property == next_property &
+                                             Operation == next_operation &
+                                             User == next_user & 
+                                             next_eventID - eventID == next_n)
+  
+  simple_event_data <- simple_event_data %>% mutate(
+    next_action_same = ifelse(next_action_same &
+                                (Code == "AC"), ifelse(
+                                  Closedquestion == next_closedquestion, TRUE, FALSE), next_action_same)
+  )
+  
+  simple_event_data$next_n_minus_1_same <- simple_event_data$next_action_same
+  names(simple_event_data)[ncol(simple_event_data)] <- paste("next", next_n, "code_same", sep = "_")
+  
+
+  simple_event_data <- dplyr::select(simple_event_data, 
+                               -'next_user', -'next_eventID', -'next_code', -'next_operation', -'next_property',
+                               -'next_closedquestion')
+}
+simple_event_data <- dplyr::select(simple_event_data, 
+                               -'next_n_minus_1_same')
+
+# remove consecutive rows with same Code
+simple_event_data$last_code_same <-
+  c(FALSE,unlist(simple_event_data[-nrow(simple_event_data), "next_1_code_same"]))
+
+simple_event_data <- simple_event_data %>% 
+  filter(last_code_same == FALSE | Code %in% c("AC","AR","Hx","AO","AI-1","AI-2","MI","CI"))
+
+simple_event_data <- simple_event_data %>% 
+  dplyr::select("User", "Log_ID", "Date_Time", "Operation", "Operation_Property",  "Action" , 
+                "Closedquestion" , "Correct_at_try" , "Code" , "day")
+
+simple_event_data <- simple_event_data %>% mutate(rowID = 1:n()) 
+
+## add a gap to events that happened in different date, drop unused columns
+simple_event_data <- simple_event_data %>% mutate(eventID = rowID + day*10 + User*100) 
+
+table(simple_event_data[, 'Code']) %>% 
+  as.data.frame() %>% 
+  write.csv("variational sp/variational_SP_event_counts.csv")
+```
+
+# Sequential patterns
+
+## identify candidate sequential patterns
+```{r}
+simple_event_data_1 <- simple_event_data
+simple_event_data_1 %>% select(User, eventID, Code) %>% 
+  write.table(., "data/formated_variational_SP_event_data.txt", sep=";", 
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+event_data_matrix <- read_baskets("data/formated_variational_SP_event_data.txt", 
+                                                   sep = ";", 
+                                    info =c("sequenceID","eventID"))
+  
+freq_seq <- cspade(event_data_matrix, parameter = list(support = 0.5, 
+                                                maxsize = 1, maxgap = 1, maxlen = 2), 
+               control = list(verbose = F))
+  
+freq_seq <- as(freq_seq, "data.frame") %>% arrange(desc(support)) 
+freq_seq$support <- freq_seq$support %>% round(digits = 3)
+freq_seq$sequence <- map_chr(freq_seq$sequence,
+                            function(x) gsub('[<>{}]', "", x, fixed = FALSE) %>%
+                              gsub(",", " => ", ., fixed = TRUE))
+freq_seq$len <- strsplit(freq_seq$sequence, " => ") %>% map(., length)
+freq_seq <- freq_seq %>% filter(len > 1) %>% dplyr::select(-len)
+
+remove(event_data_matrix)
+
+
+```
+
+## calculating log odds ratio
+
+```{r}
+# simple_event_data_1 <- simple_event_data
+simple_event_data_1[,"last_eventID"] <- c(-9, simple_event_data[1:(nrow(simple_event_data)-1), "eventID"])
+simple_event_data_1[,"next_eventID"] <- c(simple_event_data[2:nrow(simple_event_data), "eventID"], -9)
+simple_event_data_1[,"next_code"] <- c(simple_event_data[2:nrow(simple_event_data), "Code"], -9)
+simple_event_data_1 <- simple_event_data_1 %>% dplyr::select("User", "Code", "eventID", "next_code", 
+                                                             'last_eventID', "next_eventID")
+simple_event_data_1 <- simple_event_data_1 %>% mutate(next_continuous = next_eventID - eventID == 1,
+                                                      last_continuous = eventID - last_eventID == 1)
+users <- unique(simple_event_data_1$User) %>% sort(decreasing = FALSE)
+
+getCounts <- function(user){
+  single_sequence <- simple_event_data_1 %>% filter(User == user)
+
+    anticedent_counts <- single_sequence %>% filter(next_continuous)
+    N <- nrow(anticedent_counts)
+    anticedent_counts <- table(anticedent_counts$Code) %>% as.data.frame()
+    names(anticedent_counts) <- c('anticedent', 'counts')
+    consequent_counts <- single_sequence %>% filter(last_continuous)
+    consequent_counts <- table(consequent_counts$Code) %>% as.data.frame()
+    names(consequent_counts) <- c('consequent', 'counts')
+    total_counts <- list(N = N, anticedent_counts = anticedent_counts, consequent_counts = consequent_counts)
+    
+  return(total_counts)
+}
+
+getEventCounts <- function(user, anticedent, consequent){
+  anticedent_counts <- total_counts[[which(users == user)]][[2]]
+  consequent_counts <- total_counts[[which(users == user)]][[3]]
+  anticedent_counts <- anticedent_counts[which(anticedent_counts[,"anticedent"] == anticedent), 'counts']
+  consequent_counts <- consequent_counts[which(consequent_counts[,"consequent"] == consequent), 'counts']
+  N <- total_counts[[which(users == user)]][[1]]
+  if( is_empty(anticedent_counts) ){anticedent_counts = 0}
+  if( is_empty(consequent_counts) ){consequent_counts = 0}
+  output <- c(N, anticedent_counts, consequent_counts)
+  return(output)
+}
+
+
+getLogOddsRatio <- function(sp){
+  anticedent = strsplit(sp, " => ")[[1]][1]
+  consequent = strsplit(sp, " => ")[[1]][2]
+  a <- simple_event_data_1 %>% 
+    mutate(matching = (Code == anticedent) & (next_code == consequent) & next_continuous) %>% 
+    group_by(User) %>% summarise(a = sum(matching))
+  bcd <- map(users, function(x) getEventCounts(x, anticedent=anticedent, consequent=consequent))
+  bcd <- data.frame(matrix(unlist(bcd), nrow=length(bcd), byrow=TRUE),stringsAsFactors=FALSE)
+  names(bcd) <- c('N', 'anticedent_counts', 'consequent_counts')
+  output <- cbind(a, bcd)
+  output$User <- users
+  output$sequence <- sp
+  output <- output %>% mutate(b = anticedent_counts - a,
+                              c = consequent_counts - a,
+                              d = N - a - b - c,
+                              log_odds_ratio = log((a+0.5) * (d+0.5) / (b+0.5) / (c+0.5)),
+                              variance = 1/(a+0.5) + 1/(d+0.5) + 1/(b+0.5)+ 1/(c+0.5),
+                              weight = 1/variance,
+                              sum_measure = log_odds_ratio *weight)
+  pooled_sum <- sum(output$sum_measure) / sum(output$weight)
+  output <- output %>% mutate(chi_square = weight*(log_odds_ratio - pooled_sum)^2)
+  return(output)
+}
+
+total_counts <- map(users, getCounts)
+
+odds_ratio_list <- map(freq_seq$sequence, getLogOddsRatio)
+```
+
+## ranking patterns
+
+```{r}
+odds_ratio_df <- odds_ratio_list[[1]][0,]
+for (i in 1:length(odds_ratio_list)) {
+  odds_ratio_df <- rbind(odds_ratio_df, odds_ratio_list[[i]])
+}
+odds_ratio_df$lor_sd <- sqrt(odds_ratio_df$variance)
+odds_ratio_df$User <- as.character(odds_ratio_df$User)
+freq_seq_new <- odds_ratio_df %>% group_by(sequence) %>% 
+  summarise(
+  chi_square = sum(chi_square),
+  avg_log_odds_ratio = mean(log_odds_ratio),
+  avg_occurrences = mean(a),
+  avg_occurrence_rate = mean(a / N))
+freq_seq_new$freq_seq_new.p <- (1 - pchisq(freq_seq_new$chi_square, df = nrow(freq_seq_new) - 1)) %>% 
+  p.adjust("BY")
+
+freq_seq_new$I_square <- (freq_seq_new$chi_square - nrow(all_df)) / freq_seq_new$chi_square
+freq_seq_new <- freq_seq_new %>% mutate(I_square = ifelse(I_square > 0, I_square, 0),
+                                        significance = ifelse(freq_seq_new.p < 0.05, "Yes", "No"))
+
+freq_seq_new <- merge(freq_seq_new, freq_seq, by = "sequence")
+
+freq_seq_new$sequence <- map_chr(freq_seq_new$sequence,
+                            function(x) gsub(' => ', ".", x, fixed = TRUE))
+odds_ratio_df$sequence <- map_chr(odds_ratio_df$sequence,
+                            function(x) gsub(' => ', ".", x, fixed = TRUE))
+psych::corr.test(dplyr::select(freq_seq_new, -"sequence", -"significance"))
+x <- psych::corr.test(freq_seq_new[,c("I_square", "avg_log_odds_ratio", "avg_occurrences")])
+```
+
+```{r}
+load("variational SP.RData")
+library(tidyverse)
+library(caret)
+theme_set(theme_bw())
+```
+
+# Variances vs. average occurrences
+
+## Figure
+
+The scatter-plot shows the relationship between Chi-square statistics (scaled variances of log odds ratio), average log odds ratio, and average occurrences of all sequential patterns whoes support value are larger than 0.5. The table after the plot shows details of these sequential patterns.  
+* A moderate positive relationship between scaled variances and average occurrences.  
+* Some sequential patterns has few average occurrences (e.g., less than 5) but used differentially by students (e.g., CI -> AO).  
+* Some sequential patterns has average occurrences more than 10 but students did not used differentially (e.g., Hx -> Hx).  
+* Some sequential patterns has average occurrences more than 10 but negative log odds ratios (the probability of doing the the second action is smaller after the first action versus after the others; e.g., TC -> AI-2).
+
+```{r}
+scat <- freq_seq_new %>% ggplot(aes(x = avg_occurrences, y = I_square, color = avg_log_odds_ratio, shape = significance)) +
+  geom_point(alpha = 1, size = 1.6) + 
+  scale_color_continuous(type = "viridis") +
+  scale_x_continuous(breaks = c(seq(0, 120, 10)))+
+  scale_y_continuous(breaks = c(seq(0, 1, 0.2)))+
+  labs(x = 'Average instance',
+       y = expression(italic(I)^2*"(scaled variation)"),
+       color = "Average log odds ratio",
+       shape = expression("The "*italic(Q)*" test "*italic(p)*" < 0.05?")) 
+```
+
+## Table
+
+```{r}
+x <- freq_seq_new %>% arrange(desc(I_square)) 
+colnames(x)[c(1,6)] <- c("pattern","chi_square_test.p")
+x <- x %>% dplyr::select("pattern", "support","avg_log_odds_ratio", "avg_occurrences", "I_square",  "chi_square_test.p")
+x[,1] <- gsub(".", " -> ", x[,1], fixed = TRUE)
+x[,-1] <- x[-1]%>% round(2)
+x
+
+sum(x$support >= 0.9)
+```
+
+```{r}
+xxx <- odds_ratio_df %>% filter(sequence == "AO.AO") %>% arrange(desc(log_odds_ratio))
+
+getProporDiffPairs(xxx)
+
+
+quantile(xxx$log_odds_ratio, 0.75) - quantile(xxx$log_odds_ratio, 0.25)
+
+```
+
+```{r}
+temp <- odds_ratio_df %>% filter(sequence == "AO.AO") %>% arrange(desc(log_odds_ratio))
+minum <- min(temp$log_odds_ratio)
+min.sd <- temp[81,"lor_sd"]
+maximum <- max(temp$log_odds_ratio)
+max.sd<- temp[1, "lor_sd"]
+fig.aoao <- temp %>% 
+  ggplot(aes(x = reorder(User, log_odds_ratio), y = log_odds_ratio)) +
+  geom_point(size = 0.3) +
+  geom_errorbar(aes(ymin = log_odds_ratio - 1.96*lor_sd, 
+                    ymax = log_odds_ratio + 1.96*lor_sd),
+                size = 0.3)+
+  #scale_color_continuous(low = "white", high = "blue") +
+  coord_flip() +
+  scale_x_discrete(labels = NULL, breaks = NULL)+
+  scale_y_continuous(breaks = seq(0, 10, 2)) +
+  labs(x = NULL,
+       y = 'Log odds ratio with 95% confidence intervals') +
+  geom_hline(yintercept = c(minum+1.96*min.sd,
+                           maximum - 1.96*max.sd),
+             color = "red",linetype="dashed"
+             )
+fig.aoao
+```
+
+
+## in-depth investigation
+
+### high occurrences & high lor, but low variation
+
+```{r}
+temp <- odds_ratio_df %>% filter(sequence == "Hx.Hx") %>% arrange(desc(log_odds_ratio))
+minum <- min(temp$log_odds_ratio)
+min.sd <- temp[81,"lor_sd"]
+maximum <- max(temp$log_odds_ratio)
+max.sd<- temp[1, "lor_sd"]
+fig.hxhx <- temp %>% 
+  ggplot(aes(x = reorder(User, log_odds_ratio), y = log_odds_ratio)) +
+  geom_point(size = 0.3) +
+  geom_errorbar(aes(ymin = log_odds_ratio - 1.96*lor_sd, ymax = log_odds_ratio + 1.96*lor_sd),
+                size = 0.3)+
+  #scale_color_continuous(low = "white", high = "blue") +
+  coord_flip() +
+  scale_x_discrete(labels = NULL, breaks = NULL)+
+  scale_y_continuous(breaks = seq(0, 6, 1)) +
+  labs(x = NULL,
+       y = 'Log odds ratio with 95% confidence intervals')  +
+  geom_hline(yintercept = c(minum+1.96*min.sd,
+                           maximum - 1.96*max.sd),
+             color = "red",linetype="dashed"
+             )
+
+getProporDiffPairs <- function(individual_sp){
+  N <-  nrow(individual_sp)
+  individual_sp <- individual_sp %>% arrange(desc(log_odds_ratio))
+  individual_sp$lower <- individual_sp[, "log_odds_ratio"] - 1.96*individual_sp[, "lor_sd"]
+  individual_sp$upper <- individual_sp[, "log_odds_ratio"] + 1.96*individual_sp[, "lor_sd"]
+  count = 0
+  for (i1 in 1:(N-1)) {
+    count = count + sum(individual_sp[(i1+1):N, 'upper'] < individual_sp[i1, 'lower'])
+  }
+  proportion <- count / (80*81/2)
+  return(proportion)
+}
+
+fig.hxhx
+
+hx.hx <- odds_ratio_df %>% filter(sequence == "Hx.Hx") %>% arrange(desc(log_odds_ratio))
+
+
+# getProporDiffPairs(PD.PD)
+```
+
+### low occurrences high variation
+
+```{r}
+fig.oapc <- odds_ratio_df %>% filter(sequence == "OA.PC") %>% arrange(desc(log_odds_ratio)) %>% 
+  ggplot(aes(x = reorder(User, log_odds_ratio), y = log_odds_ratio)) +
+  geom_point(size = 0.4) +
+  geom_errorbar(aes(ymin = log_odds_ratio - 1.96*lor_sd, ymax = log_odds_ratio + 1.96*lor_sd))+
+  #scale_color_continuous(low = "white", high = "blue") +
+  coord_flip() +
+  scale_x_discrete(labels = NULL, breaks = NULL)+
+ scale_y_continuous(breaks = seq(-4, 5, 1)) +
+  labs(x = NULL,
+       y = 'Log odds ratio with 95% confidence intervals') 
+
+OA.PC <- odds_ratio_df %>% filter(sequence == "OA.PC") %>% arrange(desc(log_odds_ratio))
+
+getProporDiffPairs(OA.PC)
+fig.oapc
+quantile(OA.PC$log_odds_ratio, 0.25)
+quantile(OA.PC$log_odds_ratio, 0.75)
+```
+
+### low lor high variation
+
+```{r}
+fig.tcoc <- odds_ratio_df %>% filter(sequence == "TC.OC") %>% arrange(desc(log_odds_ratio)) %>% 
+  ggplot(aes(x = reorder(User, log_odds_ratio), y = log_odds_ratio)) +
+  geom_point(size = 0.4) +
+  geom_errorbar(aes(ymin = log_odds_ratio - 1.96*lor_sd, ymax = log_odds_ratio + 1.96*lor_sd))+
+  #scale_color_continuous(low = "white", high = "blue") +
+  coord_flip() +
+  scale_x_discrete(labels = NULL, breaks = NULL)+
+  scale_y_continuous(breaks = c(-2, -1.5, -1, -0.5, 0, 0.5, 1)) +
+  labs(x = NULL,
+       y = 'Log odds ratio with 95% confidence intervals') 
+
+TC.OC <- odds_ratio_df %>% filter(sequence == "TC.OC") %>% arrange(desc(log_odds_ratio))
+
+getProporDiffPairs(TC.OC)
+fig.tcoc
+```
+
+## output figs
+
+```{r}
+ggsave(filename = "picture/scat.svg", plot = scat,
+       height = 3, width = 6, units = "in")
+ggsave(filename = "picture/hxhx.svg", plot = fig.hxhx,
+       height = 3, width = 5, units = "in")
+ggsave(filename = "picture/aoao.svg", plot = fig.aoao,
+       height = 3, width = 5, units = "in")
+ggsave(filename = "picture/oapc.svg", plot = fig.oapc,
+       height = 3, width = 5, units = "in")
+ggsave(filename = "picture/tcoc.svg", plot = fig.tcoc,
+       height = 3, width = 5, units = "in")
+```
